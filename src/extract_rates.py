@@ -92,11 +92,12 @@ def load_provider_groups_from_parquet(parquet_path: str) -> Set[int]:
 
 class RateExtractor:
     def __init__(self, batch_size: int = 20000, provider_group_filter: Optional[Set[int]] = None, 
-                 cpt_whitelist: Optional[Set[str]] = None):
+                 cpt_whitelist: Optional[Set[str]] = None, output_prefix: Optional[str] = None):
         self.batch_size = batch_size
         # Convert filters to frozenset for O(1) lookups and immutability
         self.provider_group_filter = frozenset(provider_group_filter) if provider_group_filter else None
         self.cpt_whitelist = frozenset(cpt_whitelist) if cpt_whitelist else None
+        self.output_prefix = output_prefix
         self.rates_batch = []
         self.stats = {
             "start_time": datetime.now(),
@@ -235,7 +236,11 @@ class RateExtractor:
         
         # Setup output path
         slug = get_output_slug()
-        self.output_path = output_dir / f"rates_{slug}.parquet"
+        if self.output_prefix:
+            filename = f"rates_{self.output_prefix}_{slug}.parquet"
+        else:
+            filename = f"rates_{slug}.parquet"
+        self.output_path = output_dir / filename
         # First pass: extract file metadata (avoid gzip.seek(0) by reopening)
         with gzip.open(file_path, 'rb') as gz_meta:
             parser = ijson.parse(gz_meta)

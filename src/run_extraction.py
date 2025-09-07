@@ -101,7 +101,8 @@ def run_extraction_workflow(
         rate_extractor = RateExtractor(
             batch_size=rate_batch_size,
             provider_group_filter=provider_groups,
-            cpt_whitelist=cpt_whitelist
+            cpt_whitelist=cpt_whitelist,
+            output_prefix=output_prefix
         )
         
         rate_results = rate_extractor.process_file(
