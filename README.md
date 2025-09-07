@@ -1,6 +1,6 @@
 # MRF Extraction Tool
 
-A comprehensive tool for extracting provider and rate information from Machine Readable Files (MRF) with NPPES API integration and data cleaning capabilities.
+A high-performance tool for extracting provider and rate information from Machine Readable Files (MRF). Optimized for speed with performance improvements through efficient I/O and streaming processing.
 
 ## Quick Start
 
@@ -49,10 +49,10 @@ A comprehensive tool for extracting provider and rate information from Machine R
   python src/run_extraction.py "mrf_url" -mp 5000
   ```
 
-- **`--provider-batch-size` / `-pbs`** - Batch size for provider extraction (default: 1000)
+- **`--provider-batch-size` / `-pbs`** - Batch size for provider extraction (default: 10000)
   ```bash
-  python src/run_extraction.py "mrf_url" --provider-batch-size 500
-  python src/run_extraction.py "mrf_url" -pbs 500
+  python src/run_extraction.py "mrf_url" --provider-batch-size 5000
+  python src/run_extraction.py "mrf_url" -pbs 5000
   ```
 
 - **`--tin-whitelist` / `-t`** - Path to TIN whitelist file (one TIN per line)
@@ -75,10 +75,10 @@ A comprehensive tool for extracting provider and rate information from Machine R
   python src/run_extraction.py "mrf_url" -mt 120
   ```
 
-- **`--rate-batch-size` / `-rbs`** - Batch size for rate extraction (default: 5)
+- **`--rate-batch-size` / `-rbs`** - Batch size for rate extraction (default: 20000)
   ```bash
-  python src/run_extraction.py "mrf_url" --rate-batch-size 10
-  python src/run_extraction.py "mrf_url" -rbs 10
+  python src/run_extraction.py "mrf_url" --rate-batch-size 10000
+  python src/run_extraction.py "mrf_url" -rbs 10000
   ```
 
 - **`--cpt-whitelist` / `-c`** - Path to CPT code whitelist file (one code per line)
@@ -87,13 +87,6 @@ A comprehensive tool for extracting provider and rate information from Machine R
   python src/run_extraction.py "mrf_url" -c "src/cpt_codes.txt"
   ```
 
-### NPPES API Options
-
-- **`--nppes-workers` / `-nw`** - Number of concurrent NPPES API workers (default: 6)
-  ```bash
-  python src/run_extraction.py "mrf_url" --nppes-workers 10
-  python src/run_extraction.py "mrf_url" -nw 10
-  ```
 
 ## Complete Examples
 
@@ -123,28 +116,23 @@ python src/run_extraction.py "https://example.com/mrf_index.json.gz" \
 ### High-Performance Extraction
 ```bash
 python src/run_extraction.py "https://example.com/mrf_index.json.gz" \
-  --provider-batch-size 2000 \
-  --rate-batch-size 10 \
-  --nppes-workers 12 \
+  --provider-batch-size 10000 \
+  --rate-batch-size 20000 \
   --output-dir "fast_run"
 ```
 
 ## Output Files
 
-The script generates several output files:
+The script generates two main output files:
 
-1. **Providers (raw)** - `{prefix}_providers_{timestamp}.parquet`
-2. **Providers (cleaned)** - `{prefix}_providers_{timestamp}_cleaned.parquet`
-3. **Rates** - `{prefix}_rates_{timestamp}.parquet`
-4. **Merged** - `merged_rates_providers_{timestamp}.parquet`
+1. **Providers** - `{prefix}_providers_{timestamp}.parquet` - Raw provider references from MRF
+2. **Rates** - `rates_{timestamp}.parquet` - Extracted rate data with provider filtering
 
 ## Workflow Steps
 
 1. **Download MRF Index** - Downloads the MRF file if it's a URL
 2. **Extract Providers** - Extracts provider references with optional TIN filtering
-3. **Clean Providers** - Filters to NPI-2 providers using NPPES API
-4. **Extract Rates** - Extracts rates using cleaned providers as filter
-5. **Merge Data** - Combines rates and providers into final dataset
+3. **Extract Rates** - Extracts rates using raw providers as filter with CPT code filtering
 
 ## Whitelist File Formats
 
@@ -155,27 +143,35 @@ The script generates several output files:
 
 
 
+## Performance Features
+
+- **Speed Improvement**: Optimized I/O using PyArrow ParquetWriter for O(N) complexity
+- **Streaming Processing**: Uses ijson for memory-efficient JSON parsing
+- **Large Batch Sizes**: Default 20K rate batches for optimal performance
+- **Memory Management**: Automatic garbage collection and memory tracking
+- **Fast JSON Parsing**: Uses C-extension backend (yajl2_c) when available
+
 ## Memory and Performance Tips
 
-- **Batch sizes**: Larger batch sizes use more memory but are faster
-- **NPPES workers**: More workers = faster NPPES API processing (be mindful of rate limits)
+- **Batch sizes**: Larger batch sizes use more memory but are significantly faster
 - **Max limits**: Use `--max-providers` and `--max-items` for testing before full runs
 - **Output directory**: Use SSD storage for better I/O performance
+- **Memory monitoring**: Built-in memory tracking shows peak usage
 
 ## Troubleshooting
 
 ### Common Issues
 
 1. **Memory errors**: Reduce batch sizes or use max limits
-2. **Slow performance**: Increase batch sizes and NPPES workers
+2. **Slow performance**: Increase batch sizes for better performance
 3. **File permission errors**: Ensure write access to output directory
-4. **NPPES API errors**: Reduce NPPES workers to avoid rate limiting
+4. **JSON parsing errors**: Ensure MRF file is valid JSON format
 
 ### Error Messages
 
 - `Column 'provider_group_id' not found`: Ensure you're using the correct MRF format
-- `NPPES API errors`: Check internet connection and reduce worker count
 - `Memory usage high`: Reduce batch sizes or add memory limits
+- `File not found`: Check MRF URL or file path is correct
 
 ## Dependencies
 

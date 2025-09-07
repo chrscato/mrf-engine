@@ -18,8 +18,18 @@ software that may temporarily lock files.
 """
 
 import gzip
-import ijson
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+# Use faster ijson backend if available (C extensions)
+try:
+    import ijson.backends.yajl2_c as ijson
+except ImportError:
+    try:
+        import ijson.backends.yajl2 as ijson
+    except ImportError:
+        import ijson  # fallback to pure Python
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Set
@@ -31,7 +41,7 @@ if sys.platform == "win32":
     import msvcrt
     import time
 
-from utils import (
+from .utils import (
     get_memory_usage,
     force_garbage_collection,
     create_progress_bar,
@@ -81,11 +91,12 @@ def load_provider_groups_from_parquet(parquet_path: str) -> Set[int]:
         return set()
 
 class RateExtractor:
-    def __init__(self, batch_size: int = 5, provider_group_filter: Optional[Set[int]] = None, 
+    def __init__(self, batch_size: int = 20000, provider_group_filter: Optional[Set[int]] = None, 
                  cpt_whitelist: Optional[Set[str]] = None):
         self.batch_size = batch_size
-        self.provider_group_filter = provider_group_filter
-        self.cpt_whitelist = cpt_whitelist
+        # Convert filters to frozenset for O(1) lookups and immutability
+        self.provider_group_filter = frozenset(provider_group_filter) if provider_group_filter else None
+        self.cpt_whitelist = frozenset(cpt_whitelist) if cpt_whitelist else None
         self.rates_batch = []
         self.stats = {
             "start_time": datetime.now(),
@@ -95,8 +106,9 @@ class RateExtractor:
             "rates_written": 0,
             "peak_memory_mb": 0
         }
-        # Track if we've written the first batch to avoid unnecessary file reads
-        self.first_batch_written = False
+        # PyArrow ParquetWriter for O(N) writes
+        self._writer = None
+        self._schema = None
     
     def _wait_for_file_unlock(self, file_path: Path, timeout_seconds: int = 30) -> bool:
         """Wait for a file to become unlocked (Windows-specific)."""
@@ -127,70 +139,29 @@ class RateExtractor:
         return current_memory
 
     def _write_batch(self, output_path: Path) -> None:
-        """Write current batch to parquet file."""
+        """Write current batch to parquet file using PyArrow for O(N) performance."""
         if not self.rates_batch:
             return
             
-        rates_df = pd.DataFrame(self.rates_batch)
-        
-        # For the first batch, just write directly
-        if not self.first_batch_written:
-            try:
-                rates_df.to_parquet(output_path, index=False)
-                self.first_batch_written = True
-            except PermissionError as e:
-                print(f"❌ Permission error writing first batch: {e}")
-                # Try backup filename
-                backup_path = output_path.parent / f"{output_path.stem}_backup_{int(time.time())}.parquet"
-                print(f"💾 Writing to backup file: {backup_path}")
-                rates_df.to_parquet(backup_path, index=False)
-                raise
-        else:
-            # For subsequent batches, try to append with retry logic
-            try:
-                # Wait for file to be unlocked if on Windows
-                if sys.platform == "win32" and self.output_path.exists():
-                    if not self._wait_for_file_unlock(self.output_path):
-                        print(f"⚠️  File {self.output_path.name} is locked, creating backup instead...")
-                        backup_path = self.output_path.parent / f"{self.output_path.stem}_backup_{int(time.time())}.parquet"
-                        rates_df.to_parquet(backup_path, index=False)
-                        print(f"💾 Wrote to backup: {backup_path.name}")
-                        self.stats["rates_written"] += len(self.rates_batch)
-                        self.rates_batch.clear()
-                        force_garbage_collection()
-                        return
-                
-                # Use a more robust approach for appending
-                existing_df = pd.read_parquet(output_path)
-                rates_df = pd.concat([existing_df, rates_df], ignore_index=True)
-            except (PermissionError, OSError, FileNotFoundError) as e:
-                print(f"⚠️  Warning: Could not read existing file {output_path}: {e}")
-                print(f"📝 Creating new file instead...")
-                # Continue with just the new data
-                pass
-            
-            # Write with retry logic for Windows permission issues
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    rates_df.to_parquet(output_path, index=False)
-                    break
-                except PermissionError as e:
-                    if attempt < max_retries - 1:
-                        print(f"⚠️  Permission error on attempt {attempt + 1}, retrying in 2 seconds...")
-                        import time
-                        time.sleep(2)
-                    else:
-                        print(f"❌ Failed to write after {max_retries} attempts: {e}")
-                        # Try to write to a backup filename
-                        backup_path = output_path.parent / f"{output_path.stem}_backup_{int(time.time())}.parquet"
-                        print(f"💾 Writing to backup file: {backup_path}")
-                        rates_df.to_parquet(backup_path, index=False)
-                        raise
-        
+        df = pd.DataFrame(self.rates_batch)
+        table = pa.Table.from_pandas(df, preserve_index=False)
+
+        if self._writer is None:
+            self._schema = table.schema
+            # Ensure parent dir exists
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            self._writer = pq.ParquetWriter(str(output_path), self._schema)
+
+        # Align schema in case of missing cols
+        if table.schema != self._schema:
+            table = table.cast(self._schema)
+
+        self._writer.write_table(table)
         self.stats["rates_written"] += len(self.rates_batch)
         self.rates_batch.clear()
         force_garbage_collection()
+
+
 
     def _process_rate(self, item: Dict[str, Any], file_metadata: Dict[str, Any]) -> None:
         """Process a single in_network rate item."""
@@ -209,27 +180,35 @@ class RateExtractor:
             **file_metadata
         }
         
-        # Process each rate group
-        for rate_group in item.get("negotiated_rates", []):
-            for price in rate_group.get("negotiated_prices", []):
-                self.stats["rates_generated"] += 1
-                
-                # Create rate record for each provider reference
-                for provider_ref_id in rate_group.get("provider_references", []):
-                    # Apply provider group filter if specified
-                    if self.provider_group_filter and provider_ref_id not in self.provider_group_filter:
-                        continue
-                    
-                    rate_record = {
+        # Process each rate group with optimized field precomputation
+        for rate_group in item.get("negotiated_rates", []) or []:
+            # Get and filter providers once per rate group
+            providers = rate_group.get("provider_references", []) or []
+            if self.provider_group_filter:
+                providers = [p for p in providers if p in self.provider_group_filter]
+                if not providers:
+                    continue  # Skip entire rate group if no eligible providers
+            
+            # Precompute price fields once per price (avoid redundant dict lookups)
+            prices = rate_group.get("negotiated_prices", []) or []
+            price_rows = [{
+                "negotiated_rate": float(p.get("negotiated_rate", 0)),
+                "negotiated_type": p.get("negotiated_type", ""),
+                "billing_class": p.get("billing_class", ""),
+                "expiration_date": p.get("expiration_date", ""),
+                "service_codes": str(p.get("service_code", [])),
+            } for p in prices]
+            
+            # Create rate records efficiently
+            append = self.rates_batch.append
+            for provider_ref_id in providers:
+                for pr in price_rows:
+                    append({
                         "provider_reference_id": provider_ref_id,
-                        "negotiated_rate": float(price.get("negotiated_rate", 0)),
-                        "negotiated_type": price.get("negotiated_type", ""),
-                        "billing_class": price.get("billing_class", ""),
-                        "expiration_date": price.get("expiration_date", ""),
-                        "service_codes": str(price.get("service_code", [])),
+                        **pr,
                         **base_info
-                    }
-                    self.rates_batch.append(rate_record)
+                    })
+                    self.stats["rates_generated"] += 1
                     self.stats["rates_passed_filter"] += 1
                     
                     # Write batch if size threshold reached
@@ -257,10 +236,9 @@ class RateExtractor:
         # Setup output path
         slug = get_output_slug()
         self.output_path = output_dir / f"rates_{slug}.parquet"
-        
-        with gzip.open(file_path, 'rb') as gz_file:
-            # Extract file metadata first
-            parser = ijson.parse(gz_file)
+        # First pass: extract file metadata (avoid gzip.seek(0) by reopening)
+        with gzip.open(file_path, 'rb') as gz_meta:
+            parser = ijson.parse(gz_meta)
             file_metadata = {}
             for prefix, event, value in parser:
                 if prefix in ['reporting_entity_name', 'reporting_entity_type', 
@@ -268,16 +246,13 @@ class RateExtractor:
                     file_metadata[prefix] = value
                 elif prefix == 'in_network':
                     break
-            
-            # Reset file pointer for rate processing
-            gz_file.seek(0)
-            
-            # Stream process rates
-            items = ijson.items(gz_file, 'in_network.item')
+        
+        # Second pass: stream process rates (separate file handle)
+        with gzip.open(file_path, 'rb') as gz_data:
+            items = ijson.items(gz_data, 'in_network.item')
             
             # Apply limits if specified
             if max_items or max_time_minutes:
-                items = create_progress_bar(items, "Items", "item")
                 start_time = datetime.now()
                 
                 for idx, item in enumerate(items):
@@ -296,6 +271,10 @@ class RateExtractor:
                     self._process_rate(item, file_metadata)
                     self.stats["items_processed"] += 1
                     
+                    # Progress update every 100 items
+                    if self.stats["items_processed"] % 100 == 0:
+                        print(f"📊 Processed {self.stats['items_processed']:,} items...")
+                    
                     # Memory check every 10 items
                     if self.stats["items_processed"] % 10 == 0:
                         self._update_memory_stats()
@@ -309,9 +288,15 @@ class RateExtractor:
                     if self.stats["items_processed"] % 10 == 0:
                         self._update_memory_stats()
         
-        # Write final batch
-        if self.rates_batch:
-            self._write_batch(self.output_path)
+        # Write final batch and close writer
+        try:
+            if self.rates_batch:
+                self._write_batch(self.output_path)
+        finally:
+            # Close writer if opened
+            if getattr(self, "_writer", None) is not None:
+                self._writer.close()
+                self._writer = None
         
         # Check for and consolidate any backup files
         print(f"\n🔍 Checking for backup files...")
@@ -335,6 +320,7 @@ class RateExtractor:
             "output_path": str(self.output_path),
             "stats": self.stats
         }
+
     
     def _consolidate_backup_files(self):
         """Consolidate any backup files that were created during processing."""
@@ -396,7 +382,7 @@ class RateExtractor:
 if __name__ == "__main__":
     import sys
     import argparse
-    from utils import download_to_temp
+    from .utils import download_to_temp
     
     parser = argparse.ArgumentParser(description="Extract rates from MRF files")
     parser.add_argument("source", help="URL or path to MRF file")
@@ -408,8 +394,8 @@ if __name__ == "__main__":
                        help="Path to Parquet file containing provider_group_id column to filter for")
     parser.add_argument("--cpt-whitelist", "-c", type=str,
                        help="Path to text file with CPT codes (one per line)")
-    parser.add_argument("--batch-size", "-b", type=int, default=5,
-                       help="Batch size for writing (default: 5)")
+    parser.add_argument("--batch-size", "-b", type=int, default=20000,
+                       help="Batch size for writing (default: 20000)")
     
     args = parser.parse_args()
     
@@ -437,6 +423,8 @@ if __name__ == "__main__":
     
     if args.time:
         print(f"⏱️  Max time to run: {args.time} minutes")
+    
+    print(f"🔄 Sequential processing mode")
     
     try:
         # Download if URL

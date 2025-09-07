@@ -16,7 +16,7 @@ from typing import Dict, Any, List, Optional, Set
 import os
 import sys
 
-from utils import (
+from .utils import (
     get_memory_usage,
     force_garbage_collection,
     create_progress_bar,
@@ -59,7 +59,7 @@ def load_tin_whitelist(file_path: str) -> Set[str]:
 class ProviderExtractor:
     def __init__(
         self,
-        batch_size: int = 1000,
+        batch_size: int = 10000,
         provider_group_whitelist: Optional[Set[int]] = None,
         tin_whitelist: Optional[Set[str]] = None,
     ):
@@ -92,7 +92,6 @@ class ProviderExtractor:
     def _write_batch(self, output_path: Path) -> None:
         if not self.providers_batch:
             return
-        print(f"  💾 Writing batch of {len(self.providers_batch)} providers...")
         df = pd.DataFrame(self.providers_batch)
 
         if output_path.exists():
@@ -103,7 +102,6 @@ class ProviderExtractor:
         self.stats["providers_written"] += len(self.providers_batch)
         self.providers_batch.clear()
         force_garbage_collection()
-        print(f"  ✅ Batch written! Total written: {self.stats['providers_written']:,}")
 
     def _iter_provider_groups_from_inline(self, provider_obj) -> Any:
         # Inline case used by some issuers (original behavior)
@@ -208,8 +206,8 @@ class ProviderExtractor:
                 if len(self.providers_batch) >= self.batch_size:
                     self._write_batch(self.output_path)
 
-        # Occasional progress log
-        if any_emitted and (self.stats["providers_processed"] % 50 == 0):
+        # Occasional progress log (less frequent)
+        if any_emitted and (self.stats["providers_processed"] % 10000 == 0):
             print(
                 f"  ✅ provider_group_id={provider_group_id} | "
                 f"processed={self.stats['providers_processed']:,} | "
@@ -251,14 +249,13 @@ class ProviderExtractor:
             refs = ijson.items(gz_file, "provider_references.item")
 
             if max_providers:
-                refs = create_progress_bar(refs, "Provider Refs", "ref")
                 for idx, provider_ref in enumerate(refs):
                     if idx >= max_providers:
                         print(f"⏹️  Reached provider ref limit: {max_providers}")
                         break
                     self._process_provider_reference(provider_ref, file_meta)
             else:
-                for idx, provider_ref in enumerate(create_progress_bar(refs, "Provider Refs", "ref")):
+                for idx, provider_ref in enumerate(refs):
                     self._process_provider_reference(provider_ref, file_meta)
 
         # Final write
@@ -292,7 +289,7 @@ if __name__ == "__main__":
                         help="Path to text file of TINs (one per line)")
     parser.add_argument("--output", "-o", type=str,
                         help="Output filename prefix (e.g., 'cigna_ga' leads to 'cigna_ga_providers_{datetime}.parquet')")
-    parser.add_argument("--batch-size", "-b", type=int, default=1000, help="Batch size for Parquet writes")
+    parser.add_argument("--batch-size", "-b", type=int, default=10000, help="Batch size for Parquet writes (default: 10000)")
     args = parser.parse_args()
 
     # Download index if URL
