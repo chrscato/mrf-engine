@@ -10,6 +10,8 @@ Enhancement: supports Cigna-style references where each entry in
 import gzip
 import ijson
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Set
@@ -62,10 +64,12 @@ class ProviderExtractor:
         batch_size: int = 10000,
         provider_group_whitelist: Optional[Set[int]] = None,
         tin_whitelist: Optional[Set[str]] = None,
+        network_id: Optional[str] = None,
     ):
         self.batch_size = batch_size
         self.provider_group_whitelist = provider_group_whitelist or set()
         self.tin_whitelist = tin_whitelist or set()
+        self.network_id = network_id or ""
         self.providers_batch: List[Dict[str, Any]] = []
 
         self.stats = {
@@ -82,6 +86,10 @@ class ProviderExtractor:
 
         # Avoid re-fetching the same provider reference URL or group id
         self._seen_ref_urls: Set[str] = set()
+        
+        # PyArrow writer for efficient batch writing
+        self._writer = None
+        self._schema = None
         self._seen_group_ids: Set[int] = set()
 
     def _update_memory_stats(self) -> float:
@@ -92,13 +100,35 @@ class ProviderExtractor:
     def _write_batch(self, output_path: Path) -> None:
         if not self.providers_batch:
             return
+            
         df = pd.DataFrame(self.providers_batch)
+        table = pa.Table.from_pandas(df, preserve_index=False)
 
-        if output_path.exists():
-            existing = pd.read_parquet(output_path)
-            df = pd.concat([existing, df], ignore_index=True)
+        if self._writer is None:
+            # Define a consistent schema upfront to avoid type conflicts
+            self._schema = pa.schema([
+                pa.field("provider_group_id", pa.int64()),
+                pa.field("npi", pa.string()),
+                pa.field("tin_type", pa.string()),
+                pa.field("tin_value", pa.string()),
+                pa.field("location", pa.string()),
+                pa.field("reporting_entity_name", pa.string()),
+                pa.field("reporting_entity_type", pa.string()),
+                pa.field("last_updated_on", pa.string()),
+                pa.field("version", pa.string()),
+                pa.field("network_id", pa.string()),
+            ])
+            # Ensure parent dir exists
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            # Delete existing file to avoid schema conflicts
+            if output_path.exists():
+                output_path.unlink()
+            self._writer = pq.ParquetWriter(str(output_path), self._schema)
 
-        df.to_parquet(output_path, index=False)
+        # Cast table to match our predefined schema
+        table = table.cast(self._schema)
+
+        self._writer.write_table(table)
         self.stats["providers_written"] += len(self.providers_batch)
         self.providers_batch.clear()
         force_garbage_collection()
@@ -197,7 +227,9 @@ class ProviderExtractor:
                     "npi": str(npi),
                     "tin_type": tin_info.get("type", ""),
                     "tin_value": tin_value,
+                    "location": provider_ref.get("location", ""),
                     **file_meta,
+                    "network_id": file_meta.get("network_id", ""),
                 }
                 self.providers_batch.append(rec)
                 self.stats["providers_processed"] += 1
@@ -243,6 +275,10 @@ class ProviderExtractor:
                     file_meta[prefix] = value
                 elif prefix == "provider_references":
                     break
+            
+            # Add network_id from constructor if provided
+            if self.network_id:
+                file_meta["network_id"] = self.network_id
 
             # Reset and stream over provider_references
             gz_file.seek(0)
@@ -259,8 +295,14 @@ class ProviderExtractor:
                     self._process_provider_reference(provider_ref, file_meta)
 
         # Final write
-        if self.providers_batch:
-            self._write_batch(self.output_path)
+        try:
+            if self.providers_batch:
+                self._write_batch(self.output_path)
+        finally:
+            # Close writer if opened
+            if getattr(self, "_writer", None) is not None:
+                self._writer.close()
+                self._writer = None
 
         elapsed = (datetime.now() - self.stats["start_time"]).total_seconds()
         final_mem = self._update_memory_stats()

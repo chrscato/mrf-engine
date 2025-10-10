@@ -6,6 +6,7 @@ env/
 # Output files and data
 output/
 test_output/
+*.parquet
 
 # Archived code
 src/nppes_archive.py

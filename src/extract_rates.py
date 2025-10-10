@@ -92,12 +92,14 @@ def load_provider_groups_from_parquet(parquet_path: str) -> Set[int]:
 
 class RateExtractor:
     def __init__(self, batch_size: int = 20000, provider_group_filter: Optional[Set[int]] = None, 
-                 cpt_whitelist: Optional[Set[str]] = None, output_prefix: Optional[str] = None):
+                 cpt_whitelist: Optional[Set[str]] = None, output_prefix: Optional[str] = None,
+                 plan_metadata: Optional[Dict[str, str]] = None):
         self.batch_size = batch_size
         # Convert filters to frozenset for O(1) lookups and immutability
         self.provider_group_filter = frozenset(provider_group_filter) if provider_group_filter else None
         self.cpt_whitelist = frozenset(cpt_whitelist) if cpt_whitelist else None
         self.output_prefix = output_prefix
+        self.plan_metadata = plan_metadata or {}  # External plan metadata (e.g., from Aetna index)
         self.rates_batch = []
         self.stats = {
             "start_time": datetime.now(),
@@ -148,14 +150,42 @@ class RateExtractor:
         table = pa.Table.from_pandas(df, preserve_index=False)
 
         if self._writer is None:
-            self._schema = table.schema
+            # Define a consistent schema upfront to avoid type conflicts
+            self._schema = pa.schema([
+                pa.field("provider_reference_id", pa.int64()),
+                pa.field("negotiated_rate", pa.float64()),
+                pa.field("negotiated_type", pa.string()),
+                pa.field("billing_class", pa.string()),
+                pa.field("expiration_date", pa.string()),
+                pa.field("service_codes", pa.list_(pa.string())),
+                pa.field("billing_code_modifier", pa.list_(pa.string())),
+                pa.field("additional_information", pa.string()),
+                pa.field("billing_code", pa.string()),
+                pa.field("billing_code_type", pa.string()),
+                pa.field("billing_code_type_version", pa.string()),
+                pa.field("description", pa.string()),
+                pa.field("name", pa.string()),
+                pa.field("negotiation_arrangement", pa.string()),
+                pa.field("reporting_entity_name", pa.string()),
+                pa.field("reporting_entity_type", pa.string()),
+                pa.field("last_updated_on", pa.string()),
+                pa.field("version", pa.string()),
+                pa.field("plan_name", pa.string()),
+                pa.field("plan_id_type", pa.string()),
+                pa.field("plan_id", pa.string()),
+                pa.field("plan_market_type", pa.string()),
+                pa.field("network_id", pa.string()),
+                pa.field("plan_name_alt", pa.string()),
+            ])
             # Ensure parent dir exists
             output_path.parent.mkdir(parents=True, exist_ok=True)
+            # Delete existing file to avoid schema conflicts
+            if output_path.exists():
+                output_path.unlink()
             self._writer = pq.ParquetWriter(str(output_path), self._schema)
 
-        # Align schema in case of missing cols
-        if table.schema != self._schema:
-            table = table.cast(self._schema)
+        # Cast table to match our predefined schema
+        table = table.cast(self._schema)
 
         self._writer.write_table(table)
         self.stats["rates_written"] += len(self.rates_batch)
@@ -172,13 +202,25 @@ class RateExtractor:
         if self.cpt_whitelist and billing_code not in self.cpt_whitelist:
             return  # Skip this item entirely
         
+        # Ensure all required fields are present in base_info
+        # Build base_info with explicit field order to match schema
         base_info = {
             "billing_code": billing_code,
             "billing_code_type": item.get("billing_code_type", ""),
+            "billing_code_type_version": item.get("billing_code_type_version", ""),
             "description": item.get("description", ""),
             "name": item.get("name", ""),
             "negotiation_arrangement": item.get("negotiation_arrangement", ""),
-            **file_metadata
+            "reporting_entity_name": file_metadata.get("reporting_entity_name", ""),
+            "reporting_entity_type": file_metadata.get("reporting_entity_type", ""),
+            "last_updated_on": file_metadata.get("last_updated_on", ""),
+            "version": file_metadata.get("version", ""),
+            "plan_name": file_metadata.get("plan_name", ""),
+            "plan_id_type": file_metadata.get("plan_id_type", ""),
+            "plan_id": file_metadata.get("plan_id", ""),
+            "plan_market_type": file_metadata.get("plan_market_type", ""),
+            "network_id": file_metadata.get("network_id", ""),
+            "plan_name_alt": file_metadata.get("plan_name_alt", ""),
         }
         
         # Process each rate group with optimized field precomputation
@@ -194,10 +236,12 @@ class RateExtractor:
             prices = rate_group.get("negotiated_prices", []) or []
             price_rows = [{
                 "negotiated_rate": float(p.get("negotiated_rate", 0)),
-                "negotiated_type": p.get("negotiated_type", ""),
-                "billing_class": p.get("billing_class", ""),
-                "expiration_date": p.get("expiration_date", ""),
-                "service_codes": str(p.get("service_code", [])),
+                "negotiated_type": p.get("negotiated_type", "") or "",
+                "billing_class": p.get("billing_class", "") or "",
+                "expiration_date": p.get("expiration_date", "") or "",
+                "service_codes": p.get("service_code", []) or [],
+                "billing_code_modifier": p.get("billing_code_modifier", []) or [],
+                "additional_information": p.get("additional_information", "") or "",
             } for p in prices]
             
             # Create rate records efficiently
@@ -247,10 +291,18 @@ class RateExtractor:
             file_metadata = {}
             for prefix, event, value in parser:
                 if prefix in ['reporting_entity_name', 'reporting_entity_type', 
-                            'last_updated_on', 'version']:
+                            'last_updated_on', 'version',
+                            'plan_name', 'plan_id_type', 'plan_id', 'plan_market_type']:
                     file_metadata[prefix] = value
                 elif prefix == 'in_network':
                     break
+        
+        # Fill in missing plan metadata from external source (e.g., Aetna index)
+        # MRF data takes priority as source of truth; external only fills gaps
+        if self.plan_metadata:
+            for key, value in self.plan_metadata.items():
+                if key not in file_metadata or not file_metadata.get(key):
+                    file_metadata[key] = value
         
         # Second pass: stream process rates (separate file handle)
         with gzip.open(file_path, 'rb') as gz_data:

@@ -30,7 +30,13 @@ def run_extraction_workflow(
     rate_batch_size: int = 5,
     tin_whitelist_path: str = None,
     cpt_whitelist_path: str = None,
-    output_prefix: str = None
+    output_prefix: str = None,
+    plan_name: str = None,
+    plan_id_type: str = None,
+    plan_id: str = None,
+    plan_market_type: str = None,
+    plan_name_alt: str = None,
+    network_id: str = None
 ) -> Dict[str, Any]:
     """
     Run the simplified extraction workflow.
@@ -46,6 +52,12 @@ def run_extraction_workflow(
         tin_whitelist_path: Path to TIN whitelist file
         cpt_whitelist_path: Path to CPT whitelist file
         output_prefix: Prefix for output files
+        plan_name: Optional plan name (for index-based extractions)
+        plan_id_type: Optional plan ID type (EIN or HIOS)
+        plan_id: Optional plan ID
+        plan_market_type: Optional plan market type (group or individual)
+        plan_name_alt: Optional alternate plan names (when multiple plans share endpoint)
+        network_id: Optional network identifier from source URL
         
     Returns:
         Dictionary with results and file paths
@@ -73,7 +85,8 @@ def run_extraction_workflow(
         
         provider_extractor = ProviderExtractor(
             batch_size=provider_batch_size,
-            tin_whitelist=tin_whitelist
+            tin_whitelist=tin_whitelist,
+            network_id=network_id
         )
         
         provider_results = provider_extractor.process_file(
@@ -98,11 +111,27 @@ def run_extraction_workflow(
         # Load CPT whitelist
         cpt_whitelist = load_cpt_whitelist(cpt_whitelist_path) if cpt_whitelist_path else set()
         
+        # Build plan metadata dict if provided
+        plan_metadata = {}
+        if plan_name:
+            plan_metadata['plan_name'] = plan_name
+        if plan_id_type:
+            plan_metadata['plan_id_type'] = plan_id_type
+        if plan_id:
+            plan_metadata['plan_id'] = plan_id
+        if plan_market_type:
+            plan_metadata['plan_market_type'] = plan_market_type
+        if plan_name_alt:
+            plan_metadata['plan_name_alt'] = plan_name_alt
+        if network_id:
+            plan_metadata['network_id'] = network_id
+        
         rate_extractor = RateExtractor(
             batch_size=rate_batch_size,
             provider_group_filter=provider_groups,
             cpt_whitelist=cpt_whitelist,
-            output_prefix=output_prefix
+            output_prefix=output_prefix,
+            plan_metadata=plan_metadata if plan_metadata else None
         )
         
         rate_results = rate_extractor.process_file(
@@ -166,6 +195,20 @@ def main():
     parser.add_argument("--cpt-whitelist", type=str,
                        help="Path to CPT whitelist file")
     
+    # Plan metadata (for index-based extractions)
+    parser.add_argument("--plan-name", type=str,
+                       help="Plan name from index file")
+    parser.add_argument("--plan-id-type", type=str,
+                       help="Plan ID type (EIN or HIOS)")
+    parser.add_argument("--plan-id", type=str,
+                       help="Plan ID")
+    parser.add_argument("--plan-market-type", type=str,
+                       help="Plan market type (group or individual)")
+    parser.add_argument("--plan-name-alt", type=str,
+                       help="Alternate plan names (when multiple plans share endpoint)")
+    parser.add_argument("--network-id", type=str,
+                       help="Network identifier from source URL")
+    
     args = parser.parse_args()
     
     # Create output directory
@@ -183,7 +226,13 @@ def main():
         rate_batch_size=args.rate_batch_size,
         tin_whitelist_path=args.tin_whitelist,
         cpt_whitelist_path=args.cpt_whitelist,
-        output_prefix=args.output_prefix
+        output_prefix=args.output_prefix,
+        plan_name=args.plan_name,
+        plan_id_type=args.plan_id_type,
+        plan_id=args.plan_id,
+        plan_market_type=args.plan_market_type,
+        plan_name_alt=args.plan_name_alt,
+        network_id=args.network_id
     )
     
     print(f"\n🎉 Extraction completed successfully!")
