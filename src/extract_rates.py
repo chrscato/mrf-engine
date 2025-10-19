@@ -87,7 +87,7 @@ def load_provider_groups_from_parquet(parquet_path: str) -> Set[int]:
         return provider_groups
         
     except Exception as e:
-        print(f"❌ Error loading provider group whitelist: {e}")
+        print(f"ℹ️  No provider filter (inline mode will emit providers during rate extraction)")
         return set()
 
 class RateExtractor:
@@ -107,11 +107,21 @@ class RateExtractor:
             "rates_generated": 0,
             "rates_passed_filter": 0,
             "rates_written": 0,
-            "peak_memory_mb": 0
+            "peak_memory_mb": 0,
+            "linkage_mode": "unknown",  # by_reference or inline_groups
+            "synthetic_provider_groups_created": 0  # For inline mode only
         }
         # PyArrow ParquetWriter for O(N) writes
         self._writer = None
         self._schema = None
+        
+        # === INLINE SCHEMA SUPPORT: Synthetic provider ID generation ===
+        self.provider_fingerprint_map = {}  # fingerprint → synthetic provider_group_id
+        self.next_synthetic_id = 0
+        self.providers_batch = []
+        self.providers_output_path = None
+        self._provider_writer = None
+        self._provider_schema = None
     
     def _wait_for_file_unlock(self, file_path: Path, timeout_seconds: int = 30) -> bool:
         """Wait for a file to become unlocked (Windows-specific)."""
@@ -140,6 +150,110 @@ class RateExtractor:
             current_memory
         )
         return current_memory
+    
+    def _create_provider_fingerprint(self, npi_list: List, tin_type: str, tin_value: str, location: str = "") -> str:
+        """
+        Create deterministic fingerprint for provider group including location.
+        Format: tin_type|tin_value|location|sorted_npis
+        """
+        sorted_npis = "|".join(str(n) for n in sorted(npi_list)) if npi_list else ""
+        return f"{tin_type}|{tin_value}|{location}|{sorted_npis}"
+    
+    def _get_or_create_synthetic_provider_id(self, provider_group: Dict, file_meta: Dict) -> int:
+        """
+        Get or create synthetic provider_group_id for inline schema.
+        Returns ID and emits provider rows if new.
+        """
+        npi_list = provider_group.get("npi", [])
+        tin_info = provider_group.get("tin", {}) or {}
+        tin_type = tin_info.get("type", "")
+        tin_value = str(tin_info.get("value", "")).strip()
+        location = provider_group.get("location", "")
+        
+        # Create fingerprint (includes location for uniqueness)
+        fingerprint = self._create_provider_fingerprint(npi_list, tin_type, tin_value, location)
+        
+        # Return existing ID if seen
+        if fingerprint in self.provider_fingerprint_map:
+            return self.provider_fingerprint_map[fingerprint]
+        
+        # Assign new synthetic ID
+        provider_id = self.next_synthetic_id
+        self.provider_fingerprint_map[fingerprint] = provider_id
+        self.next_synthetic_id += 1
+        self.stats["synthetic_provider_groups_created"] += 1
+        
+        # Emit provider rows (one per NPI, or one empty row if no NPIs)
+        if npi_list:
+            for npi in npi_list:
+                rec = {
+                    "provider_group_id": provider_id,
+                    "npi": str(npi),
+                    "tin_type": tin_type,
+                    "tin_value": tin_value,
+                    "location": location,
+                    "reporting_entity_name": file_meta.get("reporting_entity_name", ""),
+                    "reporting_entity_type": file_meta.get("reporting_entity_type", ""),
+                    "last_updated_on": file_meta.get("last_updated_on", ""),
+                    "version": file_meta.get("version", ""),
+                    "network_id": file_meta.get("network_id", ""),
+                }
+                self.providers_batch.append(rec)
+                
+                if len(self.providers_batch) >= self.batch_size:
+                    self._write_provider_batch()
+        else:
+            # Empty NPI list: emit one row with empty NPI for join compatibility
+            rec = {
+                "provider_group_id": provider_id,
+                "npi": "",
+                "tin_type": tin_type,
+                "tin_value": tin_value,
+                "location": location,
+                "reporting_entity_name": file_meta.get("reporting_entity_name", ""),
+                "reporting_entity_type": file_meta.get("reporting_entity_type", ""),
+                "last_updated_on": file_meta.get("last_updated_on", ""),
+                "version": file_meta.get("version", ""),
+                "network_id": file_meta.get("network_id", ""),
+            }
+            self.providers_batch.append(rec)
+            
+            if len(self.providers_batch) >= self.batch_size:
+                self._write_provider_batch()
+        
+        return provider_id
+    
+    def _write_provider_batch(self) -> None:
+        """Write provider batch to parquet (for inline schema mode)."""
+        if not self.providers_batch:
+            return
+        
+        df = pd.DataFrame(self.providers_batch)
+        table = pa.Table.from_pandas(df, preserve_index=False)
+        
+        if self._provider_writer is None:
+            self._provider_schema = pa.schema([
+                pa.field("provider_group_id", pa.int64()),
+                pa.field("npi", pa.string()),
+                pa.field("tin_type", pa.string()),
+                pa.field("tin_value", pa.string()),
+                pa.field("location", pa.string()),
+                pa.field("reporting_entity_name", pa.string()),
+                pa.field("reporting_entity_type", pa.string()),
+                pa.field("last_updated_on", pa.string()),
+                pa.field("version", pa.string()),
+                pa.field("network_id", pa.string()),
+            ])
+            
+            self.providers_output_path.parent.mkdir(parents=True, exist_ok=True)
+            if self.providers_output_path.exists():
+                self.providers_output_path.unlink()
+            self._provider_writer = pq.ParquetWriter(str(self.providers_output_path), self._provider_schema)
+        
+        table = table.cast(self._provider_schema)
+        self._provider_writer.write_table(table)
+        self.providers_batch.clear()
+        force_garbage_collection()
 
     def _write_batch(self, output_path: Path) -> None:
         """Write current batch to parquet file using PyArrow for O(N) performance."""
@@ -170,10 +284,11 @@ class RateExtractor:
                 pa.field("reporting_entity_type", pa.string()),
                 pa.field("last_updated_on", pa.string()),
                 pa.field("version", pa.string()),
-                pa.field("plan_name", pa.string()),
-                pa.field("plan_id_type", pa.string()),
-                pa.field("plan_id", pa.string()),
-                pa.field("plan_market_type", pa.string()),
+                pa.field("structure_id", pa.string()),
+                pa.field("plan_name", pa.list_(pa.string())),
+                pa.field("plan_id_type", pa.list_(pa.string())),
+                pa.field("plan_id", pa.list_(pa.string())),
+                pa.field("plan_market_type", pa.list_(pa.string())),
                 pa.field("network_id", pa.string()),
                 pa.field("plan_name_alt", pa.string()),
             ])
@@ -195,7 +310,10 @@ class RateExtractor:
 
 
     def _process_rate(self, item: Dict[str, Any], file_metadata: Dict[str, Any]) -> None:
-        """Process a single in_network rate item."""
+        """
+        Process a single in_network rate item.
+        Supports both by_reference (standard) and inline_groups (FloridaBlue) per rate_group.
+        """
         billing_code = item.get("billing_code", "")
         
         # Apply CPT whitelist filter if specified
@@ -215,22 +333,40 @@ class RateExtractor:
             "reporting_entity_type": file_metadata.get("reporting_entity_type", ""),
             "last_updated_on": file_metadata.get("last_updated_on", ""),
             "version": file_metadata.get("version", ""),
-            "plan_name": file_metadata.get("plan_name", ""),
-            "plan_id_type": file_metadata.get("plan_id_type", ""),
-            "plan_id": file_metadata.get("plan_id", ""),
-            "plan_market_type": file_metadata.get("plan_market_type", ""),
+            "structure_id": file_metadata.get("structure_id", ""),
+            "plan_name": file_metadata.get("plan_name", []),
+            "plan_id_type": file_metadata.get("plan_id_type", []),
+            "plan_id": file_metadata.get("plan_id", []),
+            "plan_market_type": file_metadata.get("plan_market_type", []),
             "network_id": file_metadata.get("network_id", ""),
             "plan_name_alt": file_metadata.get("plan_name_alt", ""),
         }
         
         # Process each rate group with optimized field precomputation
         for rate_group in item.get("negotiated_rates", []) or []:
-            # Get and filter providers once per rate group
-            providers = rate_group.get("provider_references", []) or []
-            if self.provider_group_filter:
-                providers = [p for p in providers if p in self.provider_group_filter]
-                if not providers:
-                    continue  # Skip entire rate group if no eligible providers
+            # === LINKAGE MODE ROUTING: Detect per rate_group (supports mixed files) ===
+            if "provider_groups" in rate_group:
+                # INLINE MODE: Synthesize IDs from embedded provider_groups
+                self.stats["inline_groups_blocks"] += 1
+                provider_groups = rate_group.get("provider_groups", []) or []
+                if not provider_groups:
+                    continue
+                
+                providers = []
+                for prov_group in provider_groups:
+                    provider_id = self._get_or_create_synthetic_provider_id(prov_group, file_metadata)
+                    providers.append(provider_id)
+            elif "provider_references" in rate_group:
+                # BY_REFERENCE MODE: Use existing integer provider_references (standard)
+                self.stats["by_reference_blocks"] += 1
+                providers = rate_group.get("provider_references", []) or []
+                if self.provider_group_filter:
+                    providers = [p for p in providers if p in self.provider_group_filter]
+                    if not providers:
+                        continue  # Skip entire rate group if no eligible providers
+            else:
+                # No provider linkage found - skip
+                continue
             
             # Precompute price fields once per price (avoid redundant dict lookups)
             prices = rate_group.get("negotiated_prices", []) or []
@@ -278,13 +414,16 @@ class RateExtractor:
         print(f"\n💰 EXTRACTING RATES")
         print(f"📊 Initial memory: {self._update_memory_stats():.1f} MB")
         
-        # Setup output path
+        # Setup output paths
         slug = get_output_slug()
         if self.output_prefix:
             filename = f"rates_{self.output_prefix}_{slug}.parquet"
+            provider_filename = f"providers_{self.output_prefix}_{slug}.parquet"
         else:
             filename = f"rates_{slug}.parquet"
+            provider_filename = f"providers_{slug}.parquet"
         self.output_path = output_dir / filename
+        self.providers_output_path = output_dir / provider_filename
         # First pass: extract file metadata (avoid gzip.seek(0) by reopening)
         with gzip.open(file_path, 'rb') as gz_meta:
             parser = ijson.parse(gz_meta)
@@ -297,12 +436,21 @@ class RateExtractor:
                 elif prefix == 'in_network':
                     break
         
-        # Fill in missing plan metadata from external source (e.g., Aetna index)
-        # MRF data takes priority as source of truth; external only fills gaps
+        # Fill in metadata from external source (e.g., from index file)
+        # For structure_id, network_id, and plan arrays: always use external if provided
+        # For other fields: only fill if missing in MRF
         if self.plan_metadata:
             for key, value in self.plan_metadata.items():
-                if key not in file_metadata or not file_metadata.get(key):
+                if key in ['structure_id', 'network_id', 'plan_name', 'plan_id_type', 
+                          'plan_id', 'plan_market_type', 'plan_name_alt']:
                     file_metadata[key] = value
+                elif key not in file_metadata or not file_metadata.get(key):
+                    file_metadata[key] = value
+        
+        # === LINKAGE MODE: Will be determined per rate_group (supports mixed files) ===
+        # Track counts for observability
+        self.stats["by_reference_blocks"] = 0
+        self.stats["inline_groups_blocks"] = 0
         
         # Second pass: stream process rates (separate file handle)
         with gzip.open(file_path, 'rb') as gz_data:
@@ -345,15 +493,31 @@ class RateExtractor:
                     if self.stats["items_processed"] % 10 == 0:
                         self._update_memory_stats()
         
-        # Write final batch and close writer
+        # Write final batches and close writers
         try:
             if self.rates_batch:
                 self._write_batch(self.output_path)
+            # === INLINE MODE: Write final provider batch ===
+            if self.providers_batch:
+                self._write_provider_batch()
         finally:
-            # Close writer if opened
+            # Close writers if opened
             if getattr(self, "_writer", None) is not None:
                 self._writer.close()
                 self._writer = None
+            if getattr(self, "_provider_writer", None) is not None:
+                self._provider_writer.close()
+                self._provider_writer = None
+        
+        # Determine primary linkage mode for stats
+        if self.stats["inline_groups_blocks"] > 0 and self.stats["by_reference_blocks"] > 0:
+            self.stats["linkage_mode"] = "mixed"
+        elif self.stats["inline_groups_blocks"] > 0:
+            self.stats["linkage_mode"] = "inline_groups"
+        elif self.stats["by_reference_blocks"] > 0:
+            self.stats["linkage_mode"] = "by_reference"
+        else:
+            self.stats["linkage_mode"] = "unknown"
         
         # Check for and consolidate any backup files
         print(f"\n🔍 Checking for backup files...")
@@ -365,13 +529,19 @@ class RateExtractor:
         
         print(f"\n✅ RATE EXTRACTION COMPLETE")
         print(f"⏱️  Time elapsed: {elapsed:.1f} seconds")
+        print(f"📋 Linkage mode: {self.stats['linkage_mode']}")
+        print(f"   • by_reference blocks: {self.stats['by_reference_blocks']:,}")
+        print(f"   • inline_groups blocks: {self.stats['inline_groups_blocks']:,}")
         print(f"📊 Items processed: {self.stats['items_processed']:,}")
         print(f"📊 Rates generated: {self.stats['rates_generated']:,}")
         if self.provider_group_filter:
             print(f"📊 Rates passed filter: {self.stats['rates_passed_filter']:,}")
         print(f"📊 Rates written: {self.stats['rates_written']:,}")
+        if self.stats.get("synthetic_provider_groups_created", 0) > 0:
+            print(f"📊 Synthetic provider groups created: {self.stats['synthetic_provider_groups_created']:,}")
+            print(f"📁 Providers output: {self.providers_output_path}")
         print(f"🧠 Peak memory: {self.stats['peak_memory_mb']:.1f} MB")
-        print(f"📁 Output: {self.output_path}")
+        print(f"📁 Rates output: {self.output_path}")
         
         return {
             "output_path": str(self.output_path),

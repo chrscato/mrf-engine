@@ -132,7 +132,11 @@ The script generates two main output files:
 
 1. **Download MRF Index** - Downloads the MRF file if it's a URL
 2. **Extract Providers** - Extracts provider references with optional TIN filtering
+   - For **standard schema** (Aetna/UHC): Extracts from top-level `provider_references`
+   - For **inline schema** (Florida Blue): Detects and skips in ~1 second
 3. **Extract Rates** - Extracts rates using raw providers as filter with CPT code filtering
+   - For **standard schema**: Uses existing provider IDs for filtering
+   - For **inline schema**: Synthesizes provider IDs and writes `providers_*.parquet` during this step
 
 ## Whitelist File Formats
 
@@ -143,6 +147,22 @@ The script generates two main output files:
 
 
 
+## Multi-Payer Schema Support
+
+The tool **automatically detects and handles two MRF schema variants**:
+
+### Standard Schema (by_reference)
+- Used by **Aetna, UnitedHealthcare**, and most payers
+- Top-level `provider_references` array with integer IDs
+- Rates reference providers via `provider_references` field
+
+### Inline Schema (inline_groups)
+- Used by **Florida Blue, Blue Cross Blue Shield**, and some BCBS carriers
+- Provider data embedded within each `negotiated_rates[*].provider_groups`
+- Automatic synthetic ID generation for join consistency
+
+**No configuration needed** - the pipeline detects the schema automatically and processes accordingly!
+
 ## Performance Features
 
 - **Speed Improvement**: Optimized I/O using PyArrow ParquetWriter for O(N) complexity
@@ -150,6 +170,8 @@ The script generates two main output files:
 - **Large Batch Sizes**: Default 20K rate batches for optimal performance
 - **Memory Management**: Automatic garbage collection and memory tracking
 - **Fast JSON Parsing**: Uses C-extension backend (yajl2_c) when available
+- **Early Schema Detection**: Skips unnecessary processing for inline schema files (~1 second vs 3+ hours)
+- **Single-Pass Extraction**: For inline schemas, providers and rates extracted together
 
 ## Memory and Performance Tips
 
@@ -178,6 +200,36 @@ The script generates two main output files:
 - **Python 3.8+**
 - **Core packages**: requests, ijson, pyarrow, pandas, numpy, psutil, tqdm
 - **Optional**: Additional packages for advanced features
+
+## Florida Blue / BCBS-Specific Notes
+
+### Special Data Fields
+
+- **`service_codes: ["CSTM-00"]`**
+  - Florida Blue's catch-all site-of-service marker
+  - Means "applies to all service locations under this contract" (not an unknown location)
+  - Often paired with `billing_code_type: "CSTM-ALL"` for default rate entries
+  - Present in ~93% of Florida Blue rates
+
+- **`expiration_date: 9999-12-31`**
+  - Used to indicate **no expiration** ("evergreen" rate)
+  - Present in ~99.5% of Florida Blue rates
+  - Treat as valid ISO date in analytics
+  - Some rates have actual expiration dates (0.5%) for time-limited agreements
+
+- **`negotiated_type`**
+  - `"negotiated"` = flat dollar amount (most common)
+  - `"percentage"` = percentage of billed charges
+  - All types preserved correctly in extraction
+
+### Performance Benchmarks
+
+**Florida Blue BCR File** (11GB compressed, 198K items):
+- Total extraction time: **~93 minutes**
+- Rates extracted: **22.1 million**
+- Unique providers: **5,581 groups, 6,399 NPIs**
+- Peak memory: **597 MB**
+- Processing rate: **~4K rates/second**
 
 ## Support
 

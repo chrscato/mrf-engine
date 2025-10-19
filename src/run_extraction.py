@@ -27,14 +27,15 @@ def run_extraction_workflow(
     max_items: int = None,
     max_time_minutes: int = None,
     provider_batch_size: int = 10000,
-    rate_batch_size: int = 5,
+    rate_batch_size: int = 20000,
     tin_whitelist_path: str = None,
     cpt_whitelist_path: str = None,
     output_prefix: str = None,
-    plan_name: str = None,
-    plan_id_type: str = None,
-    plan_id: str = None,
-    plan_market_type: str = None,
+    structure_id: str = None,
+    plan_name: list = None,
+    plan_id_type: list = None,
+    plan_id: list = None,
+    plan_market_type: list = None,
     plan_name_alt: str = None,
     network_id: str = None
 ) -> Dict[str, Any]:
@@ -52,10 +53,11 @@ def run_extraction_workflow(
         tin_whitelist_path: Path to TIN whitelist file
         cpt_whitelist_path: Path to CPT whitelist file
         output_prefix: Prefix for output files
-        plan_name: Optional plan name (for index-based extractions)
-        plan_id_type: Optional plan ID type (EIN or HIOS)
-        plan_id: Optional plan ID
-        plan_market_type: Optional plan market type (group or individual)
+        structure_id: Optional structure identifier (e.g., "floridablue_fl_1")
+        plan_name: Optional list of plan names in this structure
+        plan_id_type: Optional list of plan ID types (EIN or HIOS)
+        plan_id: Optional list of plan IDs
+        plan_market_type: Optional list of plan market types (group or individual)
         plan_name_alt: Optional alternate plan names (when multiple plans share endpoint)
         network_id: Optional network identifier from source URL
         
@@ -100,6 +102,11 @@ def run_extraction_workflow(
         results["providers_path"] = providers_path
         results["provider_stats"] = provider_results["stats"]
         
+        # Check if inline schema detected (0 providers from Step 1)
+        if provider_results["stats"]["providers_written"] == 0:
+            print(f"\n💡 Inline schema detected (no top-level provider_references)")
+            print(f"   → Providers will be synthesized and written during Step 2 (rate extraction)")
+        
         # Step 2: Extract rates using raw providers as filter
         print(f"\n{'='*60}")
         print(f"STEP 2: EXTRACTING RATES")
@@ -113,6 +120,8 @@ def run_extraction_workflow(
         
         # Build plan metadata dict if provided
         plan_metadata = {}
+        if structure_id:
+            plan_metadata['structure_id'] = structure_id
         if plan_name:
             plan_metadata['plan_name'] = plan_name
         if plan_id_type:
@@ -145,6 +154,12 @@ def run_extraction_workflow(
         results["rates_path"] = rates_path
         results["rate_stats"] = rate_results["stats"]
         
+        # === INLINE MODE: Providers created during rate extraction ===
+        if rate_results["stats"].get("linkage_mode") == "inline_groups":
+            providers_path = rate_extractor.providers_output_path
+            results["providers_path"] = str(providers_path)
+            print(f"\n📋 Inline schema: providers written during rate extraction")
+        
         # Final statistics
         elapsed = (datetime.now() - start_time).total_seconds()
         results["total_elapsed_seconds"] = elapsed
@@ -160,11 +175,11 @@ def run_extraction_workflow(
         return results
         
     finally:
-        # Clean up temp file if downloaded
+        # Clean up temp file if downloaded (and transformed file if created)
         if mrf_url.startswith(('http://', 'https://')) and 'mrf_path' in locals():
             try:
                 Path(mrf_path).unlink()
-                print(f"🗑️ Cleaned up temp file: {mrf_path}")
+                print(f"🗑️  Cleaned up temp file: {mrf_path}")
             except:
                 pass
 
@@ -196,14 +211,16 @@ def main():
                        help="Path to CPT whitelist file")
     
     # Plan metadata (for index-based extractions)
-    parser.add_argument("--plan-name", type=str,
-                       help="Plan name from index file")
-    parser.add_argument("--plan-id-type", type=str,
-                       help="Plan ID type (EIN or HIOS)")
-    parser.add_argument("--plan-id", type=str,
-                       help="Plan ID")
-    parser.add_argument("--plan-market-type", type=str,
-                       help="Plan market type (group or individual)")
+    parser.add_argument("--structure-id", type=str,
+                       help="Structure identifier (e.g., floridablue_fl_1)")
+    parser.add_argument("--plan-name", type=str, action='append',
+                       help="Plan name(s) in this structure (can specify multiple times)")
+    parser.add_argument("--plan-id-type", type=str, action='append',
+                       help="Plan ID type(s) - EIN or HIOS (can specify multiple times)")
+    parser.add_argument("--plan-id", type=str, action='append',
+                       help="Plan ID(s) (can specify multiple times)")
+    parser.add_argument("--plan-market-type", type=str, action='append',
+                       help="Plan market type(s) - group or individual (can specify multiple times)")
     parser.add_argument("--plan-name-alt", type=str,
                        help="Alternate plan names (when multiple plans share endpoint)")
     parser.add_argument("--network-id", type=str,
@@ -227,6 +244,7 @@ def main():
         tin_whitelist_path=args.tin_whitelist,
         cpt_whitelist_path=args.cpt_whitelist,
         output_prefix=args.output_prefix,
+        structure_id=args.structure_id,
         plan_name=args.plan_name,
         plan_id_type=args.plan_id_type,
         plan_id=args.plan_id,
@@ -236,7 +254,21 @@ def main():
     )
     
     print(f"\n🎉 Extraction completed successfully!")
-    print(f"📊 Provider records: {results['provider_stats']['providers_written']:,}")
+    
+    # Show correct provider count based on linkage mode
+    if results['rate_stats'].get('linkage_mode') == 'inline_groups':
+        # For inline mode, providers were written during rate extraction
+        # Count actual rows in providers parquet
+        try:
+            import pyarrow.parquet as pq
+            provider_count = pq.read_table(results['providers_path']).num_rows
+            print(f"📊 Provider records: {provider_count:,} (inline mode)")
+        except:
+            print(f"📊 Provider records: (written during rate extraction)")
+    else:
+        # For by_reference mode, use step 1 stats
+        print(f"📊 Provider records: {results['provider_stats']['providers_written']:,}")
+    
     print(f"📊 Rate records: {results['rate_stats']['rates_written']:,}")
 
 if __name__ == "__main__":

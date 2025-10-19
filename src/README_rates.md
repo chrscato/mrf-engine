@@ -138,12 +138,29 @@ python extract_rates.py \
   --time 45
 ```
 
+## Multi-Payer Schema Support
+
+The tool **automatically handles two MRF schema variants**:
+
+### Standard Schema (by_reference)
+- **Payers:** Aetna, UnitedHealthcare, most carriers
+- **Structure:** Top-level `provider_references` array
+- **Behavior:** Uses existing integer provider IDs for filtering
+
+### Inline Schema (inline_groups)
+- **Payers:** Florida Blue, Blue Cross Blue Shield carriers
+- **Structure:** Provider data embedded in `negotiated_rates[*].provider_groups`
+- **Behavior:** Synthesizes deterministic provider IDs and writes `providers_*.parquet` during rate extraction
+
+**Detection is automatic** - no configuration needed!
+
 ## Performance Optimization
 
 ### Batch Size Guidelines
 - **Light filtering** (many providers): 5-10 (default: 5)
 - **Heavy filtering** (few providers): 10-50
 - **Memory constrained**: 1-5
+- **Inline schema** (Florida Blue): 20K (default for unified pipeline)
 
 ### Processing Limits
 - **Large files**: Use `--time` to prevent runaway processing

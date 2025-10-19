@@ -267,18 +267,47 @@ class ProviderExtractor:
         output_dir.mkdir(parents=True, exist_ok=True)
 
         with gzip.open(file_path, "rb") as gz_file:
-            # Pull file metadata first
+            # Pull file metadata first and detect schema type
             parser = ijson.parse(gz_file)
             file_meta = {}
+            has_provider_references = False
+            has_in_network = False
+            
             for prefix, event, value in parser:
                 if prefix in ["reporting_entity_name", "reporting_entity_type", "last_updated_on", "version"]:
                     file_meta[prefix] = value
                 elif prefix == "provider_references":
+                    has_provider_references = True
+                    break
+                elif prefix == "in_network":
+                    has_in_network = True
+                    # No provider_references yet, likely inline schema
+                    break
+                # Stop after reasonable amount of scanning
+                if prefix.count('.') > 3:  # Too deep, something is wrong
                     break
             
             # Add network_id from constructor if provided
             if self.network_id:
                 file_meta["network_id"] = self.network_id
+
+            # Early exit for inline schema (no provider_references)
+            if not has_provider_references:
+                print(f"ℹ️  No top-level provider_references found (inline schema detected)")
+                print(f"   → Skipping Step 1, providers will be created in Step 2")
+                # Write empty parquet for consistency
+                self._write_batch(self.output_path)
+                elapsed = (datetime.now() - self.stats["start_time"]).total_seconds()
+                print(f"\n✅ PROVIDER EXTRACTION COMPLETE")
+                print(f"⏱️  Time elapsed: {elapsed:.1f}s")
+                print(f"📊 Provider refs examined: 0")
+                print(f"📊 Filtered by group: 0")
+                print(f"📊 Filtered by TIN: 0")
+                print(f"📊 Ref files fetched: 0 (errors: 0)")
+                print(f"📊 Provider rows written: 0")
+                print(f"🧠 Peak memory: {self._update_memory_stats():.1f} MB")
+                print(f"📁 Output: {self.output_path}")
+                return {"output_path": str(self.output_path), "stats": self.stats}
 
             # Reset and stream over provider_references
             gz_file.seek(0)

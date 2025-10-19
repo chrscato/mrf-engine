@@ -6,6 +6,21 @@ This directory contains tools for extracting and processing provider data from M
 
 The `extract_providers.py` script streams through large MRF files and extracts provider information including NPIs, TIN values, and provider group IDs. It supports memory-efficient processing and flexible filtering options.
 
+### Multi-Schema Support
+
+The tool **automatically detects and handles two MRF schema variants**:
+
+- **Standard Schema (by_reference)** - Used by Aetna, UHC, most payers
+  - Extracts from top-level `provider_references` array
+  - Normal processing flow
+  
+- **Inline Schema (inline_groups)** - Used by Florida Blue, BCBS carriers
+  - Detects absence of `provider_references` in ~1 second
+  - Skips extraction (providers synthesized during rate extraction)
+  - Writes empty parquet for pipeline consistency
+
+**No configuration needed** - detection is automatic!
+
 ## Quick Start
 
 ### Basic Usage
@@ -160,6 +175,7 @@ python extract_rates.py file.json.gz \
 1. **Memory Errors**: Reduce `--batch-size` or use more specific filtering
 2. **No Output**: Check that whitelist files contain valid data
 3. **Slow Processing**: Ensure filtering is applied; consider `--max-providers` for testing
+4. **"0 providers written"**: Normal for inline schema files (Florida Blue) - providers created during rate extraction
 
 ### Debugging
 
