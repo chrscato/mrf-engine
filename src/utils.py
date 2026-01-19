@@ -34,9 +34,10 @@ def get_cloudfront_headers() -> Dict[str, str]:
         'Accept-Encoding': 'gzip, deflate, br'
     }
 
-def download_to_temp(url: str) -> str:
+def download_to_temp(url: str, quiet: bool = False) -> str:
     """Download file to temp location and return path."""
-    print(f"📥 Downloading from {url}...")
+    if not quiet:
+        print(f"📥 Downloading from {url}...")
     headers = get_cloudfront_headers()
     response = requests.get(url, headers=headers, stream=True, timeout=300)
     response.raise_for_status()

@@ -225,6 +225,8 @@ def main():
                        help="Alternate plan names (when multiple plans share endpoint)")
     parser.add_argument("--network-id", type=str,
                        help="Network identifier from source URL")
+    parser.add_argument("--quiet", action='store_true',
+                       help="Suppress tracebacks, only show clean error messages")
     
     args = parser.parse_args()
     
@@ -232,44 +234,63 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Run the workflow
-    results = run_extraction_workflow(
-        mrf_url=args.mrf_url,
-        output_dir=output_dir,
-        max_providers=args.max_providers,
-        max_items=args.max_items,
-        max_time_minutes=args.max_time,
-        provider_batch_size=args.provider_batch_size,
-        rate_batch_size=args.rate_batch_size,
-        tin_whitelist_path=args.tin_whitelist,
-        cpt_whitelist_path=args.cpt_whitelist,
-        output_prefix=args.output_prefix,
-        structure_id=args.structure_id,
-        plan_name=args.plan_name,
-        plan_id_type=args.plan_id_type,
-        plan_id=args.plan_id,
-        plan_market_type=args.plan_market_type,
-        plan_name_alt=args.plan_name_alt,
-        network_id=args.network_id
-    )
+    start_time = datetime.now()
     
-    print(f"\n🎉 Extraction completed successfully!")
-    
-    # Show correct provider count based on linkage mode
-    if results['rate_stats'].get('linkage_mode') == 'inline_groups':
-        # For inline mode, providers were written during rate extraction
-        # Count actual rows in providers parquet
-        try:
-            import pyarrow.parquet as pq
-            provider_count = pq.read_table(results['providers_path']).num_rows
-            print(f"📊 Provider records: {provider_count:,} (inline mode)")
-        except:
-            print(f"📊 Provider records: (written during rate extraction)")
-    else:
-        # For by_reference mode, use step 1 stats
-        print(f"📊 Provider records: {results['provider_stats']['providers_written']:,}")
-    
-    print(f"📊 Rate records: {results['rate_stats']['rates_written']:,}")
+    try:
+        # Run the workflow
+        results = run_extraction_workflow(
+            mrf_url=args.mrf_url,
+            output_dir=output_dir,
+            max_providers=args.max_providers,
+            max_items=args.max_items,
+            max_time_minutes=args.max_time,
+            provider_batch_size=args.provider_batch_size,
+            rate_batch_size=args.rate_batch_size,
+            tin_whitelist_path=args.tin_whitelist,
+            cpt_whitelist_path=args.cpt_whitelist,
+            output_prefix=args.output_prefix,
+            structure_id=args.structure_id,
+            plan_name=args.plan_name,
+            plan_id_type=args.plan_id_type,
+            plan_id=args.plan_id,
+            plan_market_type=args.plan_market_type,
+            plan_name_alt=args.plan_name_alt,
+            network_id=args.network_id
+        )
+        
+        # Calculate total time
+        total_time = (datetime.now() - start_time).total_seconds()
+        
+        # Get provider count based on linkage mode
+        if results['rate_stats'].get('linkage_mode') == 'inline_groups':
+            try:
+                import pyarrow.parquet as pq
+                provider_count = pq.read_table(results['providers_path']).num_rows
+            except:
+                provider_count = 0
+        else:
+            provider_count = results['provider_stats']['providers_written']
+        
+        # Get rate count
+        rate_count = results['rate_stats']['rates_written']
+        
+        if args.quiet:
+            # Compact success message for batch processing
+            print(f"✅ SUCCESS ({total_time:.1f}s | {rate_count:,} rates | {provider_count:,} providers)")
+        else:
+            # Detailed success message for interactive use
+            print(f"\n🎉 Extraction completed successfully!")
+            print(f"📊 Provider records: {provider_count:,}")
+            print(f"📊 Rate records: {rate_count:,}")
+        
+    except Exception as e:
+        if args.quiet:
+            # Clean error message for batch processing
+            print(f"❌ EXTRACTION FAILED: {str(e)}")
+            sys.exit(1)
+        else:
+            # Full traceback for debugging
+            raise
 
 if __name__ == "__main__":
     main()

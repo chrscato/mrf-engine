@@ -322,6 +322,18 @@ class RateExtractor:
         
         # Ensure all required fields are present in base_info
         # Build base_info with explicit field order to match schema
+        # Normalize list fields - ensure they're always lists, not strings
+        def normalize_list_field(value, default=None):
+            if default is None:
+                default = []
+            if value is None:
+                return default
+            if isinstance(value, list):
+                return value
+            if isinstance(value, str):
+                return [value] if value else default
+            return default if not value else [str(value)]
+        
         base_info = {
             "billing_code": billing_code,
             "billing_code_type": item.get("billing_code_type", ""),
@@ -334,10 +346,10 @@ class RateExtractor:
             "last_updated_on": file_metadata.get("last_updated_on", ""),
             "version": file_metadata.get("version", ""),
             "structure_id": file_metadata.get("structure_id", ""),
-            "plan_name": file_metadata.get("plan_name", []),
-            "plan_id_type": file_metadata.get("plan_id_type", []),
-            "plan_id": file_metadata.get("plan_id", []),
-            "plan_market_type": file_metadata.get("plan_market_type", []),
+            "plan_name": normalize_list_field(file_metadata.get("plan_name")),
+            "plan_id_type": normalize_list_field(file_metadata.get("plan_id_type")),
+            "plan_id": normalize_list_field(file_metadata.get("plan_id")),
+            "plan_market_type": normalize_list_field(file_metadata.get("plan_market_type")),
             "network_id": file_metadata.get("network_id", ""),
             "plan_name_alt": file_metadata.get("plan_name_alt", ""),
         }
@@ -375,8 +387,8 @@ class RateExtractor:
                 "negotiated_type": p.get("negotiated_type", "") or "",
                 "billing_class": p.get("billing_class", "") or "",
                 "expiration_date": p.get("expiration_date", "") or "",
-                "service_codes": p.get("service_code", []) or [],
-                "billing_code_modifier": p.get("billing_code_modifier", []) or [],
+                "service_codes": normalize_list_field(p.get("service_code")),
+                "billing_code_modifier": normalize_list_field(p.get("billing_code_modifier")),
                 "additional_information": p.get("additional_information", "") or "",
             } for p in prices]
             

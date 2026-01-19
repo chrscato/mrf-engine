@@ -1,6 +1,8 @@
-# Rate Extraction Tool - extract_rates.py
+# Rate Extraction Module
 
-Extract negotiated rates from Machine-Readable Files (MRF) with efficient filtering options.
+This module (`extract_rates.py`) handles rate extraction from Machine-Readable Files (MRF) as part of the two-step extraction workflow. It extracts negotiated rates with efficient filtering by provider groups and CPT codes, and supports both standard and inline MRF schemas.
+
+**Note**: This module is typically called as part of the `run_extraction.py` workflow, not directly. For single-file extractions, use `python -m src.run_extraction`. For batch extractions, use `python -m src.extraction_orchestrator`.
 
 ## Quick Start
 

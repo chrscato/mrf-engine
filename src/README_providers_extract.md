@@ -1,10 +1,12 @@
-# Provider Extraction Tool
+# Provider Extraction Module
 
-This directory contains tools for extracting and processing provider data from Machine-Readable Files (MRF). The main tool is `extract_providers.py`, which efficiently extracts provider references from MRF files with optional filtering capabilities.
+This module (`extract_providers_pro.py`) handles provider extraction from Machine-Readable Files (MRF) as part of the two-step extraction workflow. It efficiently extracts provider references from MRF files with optional filtering capabilities and automatic schema detection.
 
 ## Overview
 
-The `extract_providers.py` script streams through large MRF files and extracts provider information including NPIs, TIN values, and provider group IDs. It supports memory-efficient processing and flexible filtering options.
+The `extract_providers_pro.py` module streams through large MRF files and extracts provider information including NPIs, TIN values, and provider group IDs. It supports memory-efficient processing, flexible filtering options, and automatic detection of MRF schema variants.
+
+**Note**: This module is typically called as part of the `run_extraction.py` workflow, not directly. For single-file extractions, use `python -m src.run_extraction`. For batch extractions, use `python -m src.extraction_orchestrator`.
 
 ### Multi-Schema Support
 

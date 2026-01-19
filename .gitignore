@@ -8,6 +8,7 @@ output/
 test_output/
 *.parquet
 index_files/
+input/
 
 # Archived code
 src/nppes_archive.py

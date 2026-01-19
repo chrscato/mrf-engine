@@ -153,8 +153,13 @@ class ProviderExtractor:
 
         temp_path = None
         try:
-            temp_path = download_to_temp(location_url)
+            # Only print every 10th download to reduce verbosity
+            current_count = self.stats["ref_files_fetched"]
+            should_print = (current_count % 10 == 0)
+            temp_path = download_to_temp(location_url, quiet=not should_print)
             self.stats["ref_files_fetched"] += 1
+            if should_print or current_count == 0:
+                print(f"  ({self.stats['ref_files_fetched']} provider reference files downloaded...)")
             is_gz = temp_path.lower().endswith(".gz")
 
             opener = gzip.open if is_gz else open
@@ -196,7 +201,16 @@ class ProviderExtractor:
         Process a single entry under top-level 'provider_references' in the MRF index.
         This can be inline (has 'provider_groups') or Cigna-style (has 'location' URL).
         """
-        provider_group_id = provider_ref.get("provider_group_id")
+        # Safely coerce provider_group_id to int (handles JSON float/decimal values)
+        pgid_raw = provider_ref.get("provider_group_id")
+        if pgid_raw is None or pgid_raw == "":
+            return  # Skip if missing (shouldn't happen per spec, but handle gracefully)
+        
+        try:
+            provider_group_id = int(float(pgid_raw))  # Handles "123.0", 123.0, "123" safely
+        except (ValueError, TypeError):
+            return  # Skip invalid values
+        
         self.stats["providers_examined"] += 1
 
         # Filter early by provider_group_whitelist if provided
